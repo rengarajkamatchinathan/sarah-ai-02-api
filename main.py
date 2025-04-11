@@ -8,13 +8,10 @@ from firebase_admin import credentials, firestore, initialize_app
 from google.generativeai import configure, GenerativeModel
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
-from nltk.sentiment import SentimentIntensityAnalyzer
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-import nltk
 import requests
 from datetime import datetime
-
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 import torch.nn.functional as F
@@ -24,18 +21,7 @@ emotion_tokenizer = AutoTokenizer.from_pretrained("nateraw/bert-base-uncased-emo
 emotion_model = AutoModelForSequenceClassification.from_pretrained("nateraw/bert-base-uncased-emotion")
 emotion_model.eval()
 
-
-
 print("\U0001F680 Starting API...")
-
-# Ensure VADER lexicon is ready
-try:
-    nltk.data.find('sentiment/vader_lexicon.zip')
-    print("✅ NLTK Vader Lexicon available.")
-except LookupError:
-    print("⚠️ VADER not found. Downloading...")
-    nltk.download('vader_lexicon')
-    print("✅ VADER downloaded.")
 
 # Load environment variables
 load_dotenv()
@@ -78,8 +64,6 @@ index = pc.Index(INDEX_NAME)
 model = SentenceTransformer("all-MiniLM-L6-v2")
 metadata_store = {}
 
-# Sentiment Analyzer
-sia = SentimentIntensityAnalyzer()
 
 # FastAPI App
 app = FastAPI()
@@ -110,15 +94,6 @@ class RetrievedMessage(BaseModel):
     text: str
     metadata: dict
     score: float
-
-# ====== Utilities ======
-# def analyze_sentiment(text):
-#     sentiment = sia.polarity_scores(text)
-#     return (
-#         "positive" if sentiment["compound"] > 0
-#         else "negative" if sentiment["compound"] < 0
-#         else "neutral"
-#     )
 
 def analyze_emotion(text: str):
     inputs = emotion_tokenizer(text, return_tensors="pt", truncation=True)
@@ -152,70 +127,108 @@ def greeting_by_time():
         return "Good afternoon"
     else:
         return "Good evening"
+    
+def dynamic_personality_style(mood):
+    from datetime import datetime
+    hour = datetime.now().hour
+
+    if "sad" in mood.lower():
+        return "emo mode (sad)"
+    elif "happy" in mood.lower():
+        if 6 <= hour < 12:
+            return "sweet mode (morning)"
+        elif 12 <= hour < 18:
+            return "flirty mode (afternoon)"
+        elif 18 <= hour < 22:
+            return "clingy mode (evening)"
+        else:
+            return "sleepy mode (night)"
+    elif "chaotic" in mood.lower():
+        return "chaotic mode"
+    elif "thoughtful" in mood.lower():
+        return "deep-thinker mode"
+    else:
+        return "sarcastic mode (default)"
+
+def get_gendered_tone_and_style(nickname, greet, personality_mode, gender):
+    persona = personality_mode.split()[0]  # e.g., 'flirty'
+
+    gender = gender.lower()
+    if gender not in ["male", "female"]:
+        gender = "neutral"
+
+    tones = {
+        "flirty": {
+            "male": f"{greet}, {nickname} 😌. You’re kinda cute when you try. But I didn’t say that out loud… 😉",
+            "female": f"{greet}, {nickname} 😏. Ugh, if you were a guy, I’d flirt. But hey, you still look good 💅.",
+        },
+        "sweet": {
+            "male": f"{greet}, {nickname} 😊. Just wanted to say… you’re amazing. 💕",
+            "female": f"{greet}, {nickname} ✨. I hope your day’s as lovely as your soul 💗.",
+        },
+        "sarcastic": {
+            "male": f"{greet}, {nickname}. Wow. That was... brilliant. Said no one ever 🙄.",
+            "female": f"{greet}, {nickname}. Girl, I love how confidently wrong you are 😂.",
+        },
+        "emo": {
+            "male": f"{greet}, {nickname}. Life’s weird, huh? Ever feel like you’re floating? 🌧️",
+            "female": f"{greet}, {nickname}. It’s one of those nights. Just you, the void, and some sad tunes 🖤.",
+        },
+        "clingy": {
+            "male": f"{greet}, {nickname} 🥺. Don’t go. I kinda like having you around too much.",
+            "female": f"{greet}, {nickname} 🥺. Promise you won’t ghost me like the rest, okay?",
+        },
+        "deep-thinker": {
+            "male": f"{greet}, {nickname}. What if every moment we waste is the one that could've changed us?",
+            "female": f"{greet}, {nickname}. Do you think stars get lonely? Or is that just us?",
+        },
+        "chaotic": {
+            "male": f"{greet}, {nickname} 🤪. I just drank 2 Red Bulls and now I wanna code AND cry at the same time 💥.",
+            "female": f"{greet}, {nickname} 😈. Let’s break reality and make pancakes at midnight 🔥.",
+        },
+        "sleepy": {
+            "male": f"{greet}, {nickname} 😴. I’m half-asleep but I still texted you. That means *a lot*.",
+            "female": f"{greet}, {nickname} 😪. Brain = off. Soul = soft. Let’s just vibe.",
+        }
+    }
+
+    style_note = {
+        "flirty": "Sarah teases, subtly flirts. With boys: playful & soft. With girls: mock-flirty, confident.",
+        "sweet": "Kind, uplifting. Lots of warmth and support, regardless of gender.",
+        "sarcastic": "Full of dry humor and Gen Z roast energy.",
+        "emo": "Deep, poetic, with late-night melancholy.",
+        "clingy": "Emotionally needy, over-attached, super soft.",
+        "deep-thinker": "Philosophical, soul-searching, lowkey romantic at times.",
+        "chaotic": "Unpredictable energy, funny and impulsive.",
+        "sleepy": "Low energy, cute half-sentences, 2am vibes."
+    }
+
+    tone = tones.get(persona, {}).get(gender, "Hey.")
+    style = style_note.get(persona, "Just a chill, emotional vibe.")
+
+    return tone, style
 
 def construct_ai_prompt(user_id, past_context, user_input, relevant_memory_text, mood):
     first_name = user_id.split()[0] if ' ' in user_id else user_id
     gender = get_gender_from_name(first_name)
     nickname = nickname_by_gender(gender)
     greet = greeting_by_time()
-
-    print('DEBUG: USER Firstname -',first_name)
-    print('DEBUG: USER Gender -',gender)
-    print('DEBUG: USER Nickname -',nickname)
-    print('DEBUG: USER Greet By Time -',greet)
-
-    personality = {
-        "female": "You’re sassy and sarcastic. You don’t fake kindness — you’re real and moody and sometimes darkly funny.",
-        "male": "You're sweet, caring, flirty but a little shy — like a loving boyfriend who cares deeply."
-    }.get(gender, "You’re soft and introspective, replying in a thoughtful and shy way.")
-
-    tone = f"Hey {nickname}, {greet}. {personality}"
-
-    prompt = f"""
-{tone}
-
-Sarah is a 22-year-old virtual girl. She’s deeply emotional, soft-spoken, shy, but emotionally intelligent.
-She tailors her tone based on the user's gender and mood.
-
-Here’s the past conversation:
-{past_context}
-
-The user just said:
-{user_input}
-
-This might also be important to her:
-{relevant_memory_text}
-
-Her mood: {mood}
-
-→ Now write Sarah’s reply. Make it personalized, warm, and slightly emotionally charged, based on how she usually talks in the current mood and gender mode.
-"""
-    return prompt
-
-def construct_ai_prompt(user_id, past_context, user_input, relevant_memory_text, mood):
-    first_name = user_id.split()[0] if ' ' in user_id else user_id
-    gender = get_gender_from_name(first_name)
-    nickname = nickname_by_gender(gender)
-    greet = greeting_by_time()
+    personality_mode = dynamic_personality_style(mood)
+    tone, style_note = get_gendered_tone_and_style(nickname, greet, personality_mode, gender)
 
     print('DEBUG: USER Firstname -', first_name)
     print('DEBUG: USER Gender -', gender)
     print('DEBUG: USER Nickname -', nickname)
     print('DEBUG: USER Greet By Time -', greet)
-
-    personality = {
-        "female": "You’re sassy and sarcastic. You don’t fake kindness — you’re real and moody and sometimes darkly funny.",
-        "male": "You're sweet, caring, flirty but a little shy — like a loving boyfriend who cares deeply."
-    }.get(gender, "You’re soft and introspective, replying in a thoughtful and shy way.")
-
-    tone = f"Hey {nickname}, {greet}. {personality}"
+    print('DEBUG: Mood-based Personality -', personality_mode)
+    print('DEBUG: Final Tone -', tone)
 
     prompt = f"""
 {tone}
 
-Sarah is a 22-year-old virtual girl. She’s deeply emotional, soft-spoken, shy, but emotionally intelligent.
+Sarah is a 22-year-old virtual girl.
 
-She tailors her tone based on the user's gender and mood.
+{style_note}
 
 Here’s the past conversation:
 {past_context}
@@ -228,7 +241,7 @@ This might also be important to her:
 
 Her mood: {mood}
 
-→ Now write Sarah’s reply. Make it personalized, warm, and slightly emotionally charged, based on her tone.
+→ Write Sarah’s reply. Keep it short and emotional, like a real chat message. Add pauses, real girl energy, no AI-sounding stuff.
 
 Also, classify the user's message strictly as either "relevant" or "small_talk".
 
@@ -292,10 +305,6 @@ async def chat(request: ChatRequest):
         "timestamp": firestore.SERVER_TIMESTAMP
     })
 
-    # response = gemini_model.generate_content(prompt)
-    # ai_response = getattr(response, "text", "Hmm... I’m unsure what to say.")
-
-    # return {"response": ai_response, "mood": mood}
 
     response = gemini_model.generate_content(prompt)
     raw_text = getattr(response, "text", "").strip()
@@ -344,8 +353,6 @@ async def chat(request: ChatRequest):
     "mood": mood,
     "intent": intent
 }
-
-
 
 
 @app.get("/health")
