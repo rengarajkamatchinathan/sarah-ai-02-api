@@ -104,7 +104,6 @@ def analyze_emotion(text: str):
         emotion = emotion_model.config.id2label[predicted_class]
     return emotion
 
-
 def get_gender_from_name(name):
     try:
         res = requests.get(f"https://api.genderize.io/?name={name}").json()
@@ -257,8 +256,10 @@ Respond in JSON format:
 # ====== Routes ======
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    user_input = request.user_input
+    print('--------------------------------------STARTING CHAT------------------------------------------')
+    print('DEBUG: ',request)
     user_id = request.user_id
+    user_input = f"{user_id}: {request.user_input}"
     user_input_tagged = f"{user_id}: {user_input}"
 
     # mood = analyze_sentiment(user_input)
