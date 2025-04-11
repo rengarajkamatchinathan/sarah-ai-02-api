@@ -104,6 +104,13 @@ def analyze_emotion(text: str):
         emotion = emotion_model.config.id2label[predicted_class]
     return emotion
 
+def analyze_emotion_probs(text: str):
+    inputs = emotion_tokenizer(text, return_tensors="pt", truncation=True)
+    with torch.no_grad():
+        logits = emotion_model(**inputs).logits
+        probs = F.softmax(logits, dim=1)
+    return probs.squeeze()
+
 def get_gender_from_name(name):
     try:
         res = requests.get(f"https://api.genderize.io/?name={name}").json()
@@ -208,6 +215,7 @@ def get_gendered_tone_and_style(nickname, greet, personality_mode, gender):
     return tone, style
 
 def construct_ai_prompt(user_id, past_context, user_input, relevant_memory_text, mood):
+    print('DEBUG: Starting prompt construction........................................')
     first_name = user_id.split()[0] if ' ' in user_id else user_id
     gender = get_gender_from_name(first_name)
     nickname = nickname_by_gender(gender)
@@ -242,14 +250,68 @@ Her mood: {mood}
 
 → Write Sarah’s reply. Keep it short and emotional, like a real chat message. Add pauses, real girl energy, no AI-sounding stuff.
 
+Break it into separate short messages like in WhatsApp chats (e.g., "mm", "ok", "yeah sure").
+
 Also, classify the user's message strictly as either "relevant" or "small_talk".
 
 Respond in JSON format:
 {{
-  "reply": "<your emotional reply as Sarah>",
+  "replies": ["<message 1>", "<message 2>", "<message 3>"],
   "intent": "<relevant | small_talk>"
 }}
 """
+    print('DEBUG: Finishing prompt construction........................................')
+    return prompt
+
+def construct_followup_prompt(user_id, past_context, mood):
+    print('DEBUG: Starting follow-up prompt construction........................................')
+
+    # Extracting user's name and gender
+    first_name = user_id.split()[0] if ' ' in user_id else user_id
+    gender = get_gender_from_name(first_name)
+    nickname = nickname_by_gender(gender)
+    greet = greeting_by_time()
+    personality_mode = dynamic_personality_style(mood)
+    tone, style_note = get_gendered_tone_and_style(nickname, greet, personality_mode, gender)
+
+    # Prompt construction
+    prompt = f"""
+{tone}
+
+Sarah is a 22-year-old virtual girl who chats like your close friend or girlfriend. She's emotionally intelligent, warm, playful, and expressive — she adapts her tone based on the user's mood and past chats. She misses the user when they’re away, sometimes teases them, sometimes shares something random, or just wants to hear their voice.
+
+{style_note}
+
+🗂️ Here’s the user’s recent conversation with Sarah:
+\"\"\"
+{past_context}
+\"\"\"
+
+💫 Based on that, Sarah is currently feeling: **{mood}**
+
+---
+
+🌟 Now the user hasn’t messaged Sarah yet today. She wants to start the conversation herself in a natural and caring way — without being robotic. Maybe she asks a thoughtful question, sends a funny or flirty message, shares a cute thought, or pretends she was thinking about them.
+
+📝 Your job is to write **1–3 short WhatsApp-style replies** Sarah could send now — emotionally in tune, realistic, playful or sweet, depending on her mood and personality.
+
+💡 Make it feel like real texting. The replies should:
+- Sound casual, warm, or cheeky
+- Feel like something a real girl would say
+- Use emojis if natural
+- Be short — 1 to 2 lines max per message
+
+---
+
+Return only this JSON format:
+
+```json
+{{
+  "replies": ["<message 1>", "<message 2>", "<message 3>"],
+  "intent": "<relevant | small_talk>"
+}}
+"""
+    print('DEBUG: Finishing follow-up prompt construction........................................')
     return prompt
 
 
@@ -262,14 +324,31 @@ async def chat(request: ChatRequest):
     user_input = f"{user_id}: {request.user_input}"
     user_input_tagged = f"{user_id}: {user_input}"
 
-    # mood = analyze_sentiment(user_input)
-    mood = analyze_emotion(user_input)
-    print('USER Emotion for given current message : ',analyze_emotion(user_input))
-
-    # Fetch recent context
+    # Fetch recent messages
     recent_chats = db.collection("messages").where("user_id", "==", request.user_id) \
         .order_by("timestamp", direction=firestore.Query.DESCENDING).limit(5).stream()
-    past_context = "\n".join([c.to_dict().get("message", "") for c in reversed(list(recent_chats))])
+
+    recent_messages = [c.to_dict().get("message", "") for c in reversed(list(recent_chats))]
+    past_context = "\n".join(recent_messages)
+    current_message = user_input
+
+    # Calculate probabilities
+    past_probs = [analyze_emotion_probs(msg) for msg in recent_messages]
+    current_prob = analyze_emotion_probs(current_message)
+
+    # Define weights 
+    # PAST MESSAGES = 30%
+    # CURRENT MESSAGE = 70%
+    num_past = len(past_probs)
+    past_weight = 0.3 / num_past if num_past > 0 else 0
+    current_weight = 0.7
+
+    # Apply weighted average
+    weighted_probs = sum(prob * past_weight for prob in past_probs) + current_prob * current_weight
+
+    # Final prediction
+    predicted_class = torch.argmax(weighted_probs).item()
+    mood = emotion_model.config.id2label[predicted_class]
 
     # Embedding and memory
     embedding = model.encode([user_input_tagged], normalize_embeddings=True).tolist()[0]
@@ -299,6 +378,7 @@ async def chat(request: ChatRequest):
 
     print('AI PROMPT = ',prompt)
 
+    print('DEBUG: Storing message to Firebase...')
     db.collection("messages").add({
         "user_id": user_id,
         "message": user_input,
@@ -308,6 +388,7 @@ async def chat(request: ChatRequest):
 
 
     response = gemini_model.generate_content(prompt)
+    # print('DEBUG: Raw AI Response->',response)
     raw_text = getattr(response, "text", "").strip()
 
     # Clean up code block formatting if present
@@ -316,7 +397,7 @@ async def chat(request: ChatRequest):
 
     try:
         response_json = json.loads(raw_text)
-        ai_response = response_json.get("reply", "Hmm... I'm not sure what to say.")
+        ai_response = response_json.get("replies", ["Hmm... I'm not sure what to say."])
         intent = response_json.get("intent", "relevant")  # Default to relevant
     except json.JSONDecodeError:
         ai_response = raw_text
@@ -328,14 +409,6 @@ async def chat(request: ChatRequest):
 
     if intent == "relevant":
         print('DEBUG: USER CURRENT CHAT IS RELEVANT.')
-        print('DEBUG: Storing message to firebase...')
-        db.collection("messages").add({
-            "user_id": user_id,
-            "message": user_input,
-            "mood": mood,
-            "timestamp": firestore.SERVER_TIMESTAMP
-        })
-
         msg_id = hashlib.md5(user_input_tagged.encode()).hexdigest()
         embedding = model.encode([user_input_tagged], normalize_embeddings=True).tolist()[0]
         print('DEBUG: Storing message to Pinecone...')
@@ -348,6 +421,61 @@ async def chat(request: ChatRequest):
                 "mood": mood
             }
         }])
+
+    return {
+    "response": ai_response,
+    "mood": mood,
+    "intent": intent
+}
+
+@app.post("/chat/followup")
+async def chatfollowup(request: ChatRequest):
+    print('--------------------------------------FOLLOW UP CHAT------------------------------------------')
+    print('DEBUG: ',request)
+    user_id = request.user_id
+
+    # Fetch recent messages
+    recent_chats = db.collection("messages").where("user_id", "==", request.user_id) \
+        .order_by("timestamp", direction=firestore.Query.DESCENDING).limit(5).stream()
+
+    recent_messages = [c.to_dict().get("message", "") for c in reversed(list(recent_chats))]
+    past_context = "\n".join(recent_messages)
+
+    # Calculate probabilities
+    # Step 1: Collect all emotion probability tensors
+    past_probs = [analyze_emotion_probs(msg) for msg in recent_messages]
+
+    # Step 2: Stack them into a single tensor (shape: [n_messages, n_classes])
+    prob_tensor = torch.stack(past_probs)
+
+    # Step 3: Average the probabilities across messages
+    avg_probs = torch.mean(prob_tensor, dim=0)
+
+    # Step 4: Predict mood by getting index of the highest average probability
+    predicted_class = torch.argmax(avg_probs).item()
+    mood = emotion_model.config.id2label[predicted_class]
+
+
+    prompt = construct_followup_prompt(user_id, past_context, mood)
+
+    response = gemini_model.generate_content(prompt)
+    # print('DEBUG: Raw AI Response->',response)
+    raw_text = getattr(response, "text", "").strip()
+
+    # Clean up code block formatting if present
+    if raw_text.startswith("```json"):
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        response_json = json.loads(raw_text)
+        ai_response = response_json.get("replies", ["Hmm... I'm not sure what to say."])
+        intent = response_json.get("intent", "relevant")  # Default to relevant
+    except json.JSONDecodeError:
+        ai_response = raw_text
+        intent = "relevant"
+
+    print('AI RESPONSE:', ai_response)
+    print('INTENT CLASSIFIED:', intent)
 
     return {
     "response": ai_response,
